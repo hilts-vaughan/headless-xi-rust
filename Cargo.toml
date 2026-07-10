@@ -1,0 +1,21 @@
+[package]
+name = "headless-xi"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "headless_xi"
+path = "src/lib.rs"
+
+[[bin]]
+name = "headless-xi"
+path = "src/bin/headless-xi.rs"
+
+[dependencies]
+blowfish = "0.9"
+byteorder = "1.5"
+cipher = "0.4"
+clap = { version = "4.5", features = ["derive"] }
+md-5 = "0.10"
+thiserror = "2.0"
