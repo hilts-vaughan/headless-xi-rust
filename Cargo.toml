@@ -13,9 +13,7 @@ name = "headless-xi"
 path = "src/bin/headless-xi.rs"
 
 [dependencies]
-blowfish = "0.9"
 byteorder = "1.5"
-cipher = "0.4"
 clap = { version = "4.5", features = ["derive"] }
 md-5 = "0.10"
 thiserror = "2.0"

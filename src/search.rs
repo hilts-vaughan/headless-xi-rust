@@ -2,11 +2,11 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-use blowfish::Blowfish;
 use byteorder::{ByteOrder, LittleEndian};
-use cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 use md5::{Digest, Md5};
 use thiserror::Error;
+
+mod blowfish_consts;
 
 const IXFF: u32 = 0x4646_5849;
 const HEADER_LEN: usize = 8;
@@ -114,6 +114,7 @@ impl SearchClient {
         loop {
             let packet = read_packet(&mut stream)?;
             let decoded = crypto.decrypt(packet)?;
+            dump_packet_if_requested(&decoded);
             let response = parse_search_list_packet(&decoded)?;
             players.extend(response.players);
             if response.final_packet {
@@ -190,10 +191,42 @@ impl SearchCrypto {
         }
 
         self.key[16..20].copy_from_slice(&packet[len - KEY_TRAILER_LEN..]);
-        let digest = md5_bytes(&self.key[..20]);
+        let digest = md5_bytes(&self.key);
         blowfish_crypt(&mut packet, len, &digest, Direction::Decrypt)?;
         validate_hash(&packet)?;
         self.key[20..24].copy_from_slice(&packet[len - 0x18..len - 0x14]);
+        Ok(packet)
+    }
+
+    #[cfg(test)]
+    fn decrypt_client_request_for_test(
+        &mut self,
+        mut packet: Vec<u8>,
+    ) -> Result<Vec<u8>, SearchError> {
+        let len = packet.len();
+        self.key[16..20].copy_from_slice(&packet[len - KEY_TRAILER_LEN..]);
+        let digest = md5_bytes(&self.key[..20]);
+        blowfish_crypt(&mut packet, len, &digest, Direction::Decrypt)?;
+        validate_hash(&packet)?;
+        Ok(packet)
+    }
+
+    #[cfg(test)]
+    fn encrypt_server_response_for_test(
+        &mut self,
+        mut packet: Vec<u8>,
+    ) -> Result<Vec<u8>, SearchError> {
+        let len = packet.len();
+        LittleEndian::write_u16(&mut packet[0..2], len as u16);
+        LittleEndian::write_u32(&mut packet[4..8], IXFF);
+
+        let digest = md5_bytes(&self.key);
+        let hash_start = len - HASH_LEN - KEY_TRAILER_LEN;
+        let hash = md5_bytes(&packet[HEADER_LEN..hash_start]);
+        packet[hash_start..hash_start + HASH_LEN].copy_from_slice(&hash);
+
+        blowfish_crypt(&mut packet, len, &digest, Direction::Encrypt)?;
+        packet[len - KEY_TRAILER_LEN..].copy_from_slice(&self.key[16..20]);
         Ok(packet)
     }
 }
@@ -209,8 +242,7 @@ fn blowfish_crypt(
     key: &[u8; 16],
     direction: Direction,
 ) -> Result<(), SearchError> {
-    let cipher = Blowfish::<byteorder::LE>::new_from_slice(key)
-        .map_err(|err| SearchError::Crypto(format!("invalid blowfish key: {err}")))?;
+    let cipher = XiBlowfish::new(key);
     let mut words = (len - 12) / 4;
     words -= words % 2;
 
@@ -220,13 +252,107 @@ fn blowfish_crypt(
         if end > packet.len() {
             break;
         }
-        let block = cipher::generic_array::GenericArray::from_mut_slice(&mut packet[start..end]);
+        let mut left = LittleEndian::read_u32(&packet[start..start + 4]);
+        let mut right = LittleEndian::read_u32(&packet[start + 4..end]);
         match direction {
-            Direction::Encrypt => cipher.encrypt_block(block),
-            Direction::Decrypt => cipher.decrypt_block(block),
+            Direction::Encrypt => cipher.encipher(&mut left, &mut right),
+            Direction::Decrypt => cipher.decipher(&mut left, &mut right),
         }
+        LittleEndian::write_u32(&mut packet[start..start + 4], left);
+        LittleEndian::write_u32(&mut packet[start + 4..end], right);
     }
     Ok(())
+}
+
+struct XiBlowfish {
+    p: [u32; 18],
+    s: [[u32; 256]; 4],
+}
+
+impl XiBlowfish {
+    fn new(key: &[u8]) -> Self {
+        let mut cipher = Self {
+            p: blowfish_consts::P,
+            s: blowfish_consts::S,
+        };
+
+        let mut key_index = 0;
+        for p in &mut cipher.p {
+            let mut data = 0u32;
+            for _ in 0..4 {
+                data = (data << 8) | ((key[key_index] as i8) as i32 as u32);
+                key_index += 1;
+                if key_index >= key.len() {
+                    key_index = 0;
+                }
+            }
+            *p ^= data;
+        }
+
+        let mut left = 0;
+        let mut right = 0;
+        for i in (0..18).step_by(2) {
+            cipher.encipher(&mut left, &mut right);
+            cipher.p[i] = left;
+            cipher.p[i + 1] = right;
+        }
+        for i in 0..4 {
+            for j in (0..256).step_by(2) {
+                cipher.encipher(&mut left, &mut right);
+                cipher.s[i][j] = left;
+                cipher.s[i][j + 1] = right;
+            }
+        }
+
+        cipher
+    }
+
+    fn encipher(&self, left: &mut u32, right: &mut u32) {
+        let mut xl = *left;
+        let mut xr = *right;
+
+        for i in 0..16 {
+            xl ^= self.p[i];
+            xr ^= self.round(xl);
+            std::mem::swap(&mut xl, &mut xr);
+        }
+        std::mem::swap(&mut xl, &mut xr);
+        xr ^= self.p[16];
+        xl ^= self.p[17];
+
+        *left = xl;
+        *right = xr;
+    }
+
+    fn decipher(&self, left: &mut u32, right: &mut u32) {
+        let mut xl = *left;
+        let mut xr = *right;
+
+        for i in (2..=17).rev() {
+            xl ^= self.p[i];
+            xr ^= self.round(xl);
+            std::mem::swap(&mut xl, &mut xr);
+        }
+        std::mem::swap(&mut xl, &mut xr);
+        xr ^= self.p[1];
+        xl ^= self.p[0];
+
+        *left = xl;
+        *right = xr;
+    }
+
+    fn round(&self, working: u32) -> u32 {
+        let s = |index: usize| self.s[index / 256][index % 256];
+        let a = ((working >> 8) & 0xff) as usize;
+        let b = (working >> 24) as usize;
+        let c = ((working >> 16) & 0xff) as usize;
+        let d = (working & 0xff) as usize;
+
+        ((s(256 + a) & 1) ^ 32)
+            .wrapping_add((s(768 + b) & 1) ^ 32)
+            .wrapping_add(s(512 + c))
+            .wrapping_add(s(d))
+    }
 }
 
 fn validate_hash(packet: &[u8]) -> Result<(), SearchError> {
@@ -243,6 +369,20 @@ fn md5_bytes(data: &[u8]) -> [u8; 16] {
     let mut hasher = Md5::new();
     hasher.update(data);
     hasher.finalize().into()
+}
+
+fn dump_packet_if_requested(packet: &[u8]) {
+    if std::env::var_os("HEADLESS_XI_DUMP_PACKETS").is_none() {
+        return;
+    }
+
+    eprintln!("decrypted packet ({} bytes):", packet.len());
+    for chunk in packet.chunks(16) {
+        for byte in chunk {
+            eprint!("{byte:02x} ");
+        }
+        eprintln!();
+    }
 }
 
 struct SearchListResponse {
@@ -456,14 +596,31 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_sea_all_request_validates_after_local_decrypt() {
+    fn encrypted_sea_all_request_validates_as_client_request() {
         let mut writer = SearchCrypto::new();
         let encrypted = writer.encrypt(build_sea_all_request()).unwrap();
 
         let mut reader = SearchCrypto::new();
-        let decrypted = reader.decrypt(encrypted).unwrap();
+        let decrypted = reader.decrypt_client_request_for_test(encrypted).unwrap();
 
         assert_eq!(decrypted[0x0b], TCP_SEARCH_ALL);
         assert_eq!(decrypted[0x10], 0);
+    }
+
+    #[test]
+    fn encrypted_search_response_validates_after_local_decrypt() {
+        let mut packet = vec![0u8; 0x30];
+        packet[0x0a] = 0x80;
+        packet[0x0b] = 0x80;
+        LittleEndian::write_u16(&mut packet[0x08..0x0a], 0x18);
+
+        let mut server = SearchCrypto::new();
+        let encrypted = server.encrypt_server_response_for_test(packet).unwrap();
+
+        let mut client = SearchCrypto::new();
+        let decrypted = client.decrypt(encrypted).unwrap();
+
+        assert_eq!(decrypted[0x0a], 0x80);
+        assert_eq!(decrypted[0x0b], 0x80);
     }
 }
