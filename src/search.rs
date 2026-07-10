@@ -12,7 +12,7 @@ const IXFF: u32 = 0x4646_5849;
 const HEADER_LEN: usize = 8;
 const HASH_LEN: usize = 16;
 const KEY_TRAILER_LEN: usize = 4;
-const SEARCH_REQUEST_LEN: usize = 0x30;
+const SEARCH_REQUEST_LEN: usize = 0x4c;
 const MAX_PACKET_LEN: usize = 4096;
 
 const TCP_SEARCH_ALL: u8 = 0x00;
@@ -112,7 +112,12 @@ impl SearchClient {
 
         let mut players = Vec::new();
         loop {
-            let packet = read_packet(&mut stream)?;
+            let packet = match read_packet(&mut stream) {
+                Ok(packet) => packet,
+                Err(SearchError::Io(err)) if players.is_empty() => return Err(err.into()),
+                Err(SearchError::Io(err)) if is_timeout_error(&err) => break,
+                Err(err) => return Err(err),
+            };
             let decoded = crypto.decrypt(packet)?;
             dump_packet_if_requested(&decoded);
             let response = parse_search_list_packet(&decoded)?;
@@ -124,6 +129,13 @@ impl SearchClient {
 
         Ok(players)
     }
+}
+
+fn is_timeout_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
 }
 
 pub fn list_online_players(addr: SocketAddr) -> Result<Vec<OnlinePlayer>, SearchError> {
@@ -148,7 +160,17 @@ fn build_sea_all_request() -> Vec<u8> {
     let mut packet = vec![0u8; SEARCH_REQUEST_LEN];
     LittleEndian::write_u16(&mut packet[0..2], SEARCH_REQUEST_LEN as u16);
     LittleEndian::write_u32(&mut packet[4..8], IXFF);
+    LittleEndian::write_u16(&mut packet[0x08..0x0a], 0x13);
+    packet[0x0a] = 0x80;
     packet[0x0b] = TCP_SEARCH_ALL;
+    packet[0x10] = 0x02;
+    packet[0x12] = 0x10;
+    LittleEndian::write_u32(&mut packet[0x14..0x18], 60_000);
+    LittleEndian::write_u32(&mut packet[0x18..0x1c], 60_000);
+    LittleEndian::write_u32(&mut packet[0x1c..0x20], 3);
+    LittleEndian::write_u32(&mut packet[0x20..0x24], 3);
+    LittleEndian::write_u32(&mut packet[0x24..0x28], 0x10);
+    LittleEndian::write_u32(&mut packet[0x30..0x34], 60_000);
     packet
 }
 
@@ -416,7 +438,15 @@ fn parse_search_list_packet(packet: &[u8]) -> Result<SearchListResponse, SearchE
         }
         let entity_end = (size_offset + entity_size + 1) * 8;
         offset += 8;
-        players.push(parse_player(packet, &mut offset, entity_end)?);
+        let player_start = offset;
+        let player =
+            parse_player(packet, &mut offset, entity_end, BitOrder::Lsb).or_else(|_| {
+                offset = player_start;
+                parse_player(packet, &mut offset, entity_end, BitOrder::Msb)
+            })?;
+        if is_valid_player_name(&player.name) {
+            players.push(player);
+        }
         offset = entity_end;
     }
 
@@ -430,71 +460,72 @@ fn parse_player(
     packet: &[u8],
     offset: &mut usize,
     entity_end_bits: usize,
+    bit_order: BitOrder,
 ) -> Result<OnlinePlayer, SearchError> {
     let mut player = OnlinePlayer::new();
     while *offset + 5 <= entity_end_bits {
-        let entry = unpack_bits_le(packet, *offset, 5);
+        let entry = unpack_bits(packet, *offset, 5, bit_order);
         *offset += 5;
 
         match entry {
             SEARCH_NAME => {
-                let len = unpack_bits_le(packet, *offset, 4) as usize;
+                let len = unpack_bits(packet, *offset, 4, bit_order) as usize;
                 *offset += 4;
                 if len == 0 && !player.name.is_empty() {
                     break;
                 }
                 let mut name = String::with_capacity(len);
                 for _ in 0..len {
-                    name.push((unpack_bits_le(packet, *offset, 7) as u8) as char);
+                    name.push((unpack_bits(packet, *offset, 7, bit_order) as u8) as char);
                     *offset += 7;
                 }
                 player.name = name;
             }
             SEARCH_AREA => {
-                player.zone = Some(unpack_bits_le(packet, *offset, 10) as u16);
+                player.zone = Some(unpack_bits(packet, *offset, 10, bit_order) as u16);
                 *offset += 10;
             }
             SEARCH_NATION => {
-                player.nation = Some(unpack_bits_le(packet, *offset, 2) as u8);
+                player.nation = Some(unpack_bits(packet, *offset, 2, bit_order) as u8);
                 *offset += 2;
             }
             SEARCH_JOB => {
-                player.main_job = Some(unpack_bits_le(packet, *offset, 5) as u8);
+                player.main_job = Some(unpack_bits(packet, *offset, 5, bit_order) as u8);
                 *offset += 5;
-                player.sub_job = Some(unpack_bits_le(packet, *offset, 5) as u8);
+                player.sub_job = Some(unpack_bits(packet, *offset, 5, bit_order) as u8);
                 *offset += 5;
             }
             SEARCH_LEVEL => {
-                player.main_level = Some(unpack_bits_le(packet, *offset, 8) as u8);
+                player.main_level = Some(unpack_bits(packet, *offset, 8, bit_order) as u8);
                 *offset += 8;
-                player.sub_level = Some(unpack_bits_le(packet, *offset, 8) as u8);
+                player.sub_level = Some(unpack_bits(packet, *offset, 8, bit_order) as u8);
                 *offset += 8;
             }
             SEARCH_RACE => {
-                player.race = Some(unpack_bits_le(packet, *offset, 4) as u8);
+                player.race = Some(unpack_bits(packet, *offset, 4, bit_order) as u8);
                 *offset += 4;
             }
             SEARCH_RANK => {
-                player.rank = Some(unpack_bits_le(packet, *offset, 8) as u8);
+                player.rank = Some(unpack_bits(packet, *offset, 8, bit_order) as u8);
                 *offset += 8;
             }
             SEARCH_FLAGS1 => {
-                player.flags1 = Some(unpack_bits_le(packet, *offset, 16) as u32);
+                player.flags1 = Some(unpack_bits(packet, *offset, 16, bit_order) as u32);
                 *offset += 16;
             }
             SEARCH_ID => {
-                player.id = Some(unpack_bits_le(packet, *offset, 20) as u32);
+                player.id = Some(unpack_bits(packet, *offset, 20, bit_order) as u32);
                 *offset += 20;
             }
             SEARCH_UNK0X0E | SEARCH_COMMENT | SEARCH_FLAGS2 => {
-                let value = unpack_bits_le(packet, *offset, 32) as u32;
+                let value = unpack_bits(packet, *offset, 32, bit_order) as u32;
                 if entry == SEARCH_FLAGS2 {
                     player.flags2 = Some(value);
                 }
                 *offset += 32;
             }
             SEARCH_LANGUAGE => {
-                player.languages = Some(unpack_bits_le(packet, *offset, 16) as u16);
+                player.languages = Some(unpack_bits(packet, *offset, 16, bit_order) as u16);
                 *offset += 16;
             }
             _ => {
@@ -513,6 +544,23 @@ fn parse_player(
     Ok(player)
 }
 
+fn is_valid_player_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+#[derive(Clone, Copy)]
+enum BitOrder {
+    Lsb,
+    Msb,
+}
+
+fn unpack_bits(buf: &[u8], bit_offset: usize, width: usize, bit_order: BitOrder) -> u64 {
+    match bit_order {
+        BitOrder::Lsb => unpack_bits_le(buf, bit_offset, width),
+        BitOrder::Msb => unpack_bits_msb(buf, bit_offset, width),
+    }
+}
+
 fn unpack_bits_le(buf: &[u8], bit_offset: usize, width: usize) -> u64 {
     let mut value = 0u64;
     for bit in 0..width {
@@ -520,6 +568,17 @@ fn unpack_bits_le(buf: &[u8], bit_offset: usize, width: usize) -> u64 {
         let byte = buf.get(absolute / 8).copied().unwrap_or_default();
         let set = (byte >> (absolute % 8)) & 1;
         value |= u64::from(set) << bit;
+    }
+    value
+}
+
+fn unpack_bits_msb(buf: &[u8], bit_offset: usize, width: usize) -> u64 {
+    let mut value = 0u64;
+    for bit in 0..width {
+        let absolute = bit_offset + bit;
+        let byte = buf.get(absolute / 8).copied().unwrap_or_default();
+        let set = (byte >> (7 - (absolute % 8))) & 1;
+        value = (value << 1) | u64::from(set);
     }
     value
 }
@@ -542,15 +601,19 @@ mod tests {
     }
 
     #[test]
-    fn sea_all_request_sets_minimal_search_all_body() {
+    fn sea_all_request_matches_captured_search_all_body() {
         let packet = build_sea_all_request();
         assert_eq!(
             LittleEndian::read_u16(&packet[0..2]),
             SEARCH_REQUEST_LEN as u16
         );
         assert_eq!(LittleEndian::read_u32(&packet[4..8]), IXFF);
+        assert_eq!(LittleEndian::read_u16(&packet[0x08..0x0a]), 0x13);
+        assert_eq!(packet[0x0a], 0x80);
         assert_eq!(packet[0x0b], TCP_SEARCH_ALL);
-        assert_eq!(packet[0x10], 0);
+        assert_eq!(packet[0x10], 0x02);
+        assert_eq!(LittleEndian::read_u32(&packet[0x14..0x18]), 60_000);
+        assert_eq!(LittleEndian::read_u32(&packet[0x1c..0x20]), 3);
     }
 
     #[test]
@@ -596,6 +659,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_horizon_msb_bitpacked_search_player() {
+        let record =
+            decode_hex("2202c1c3930ed09ec246f1912c94a300a3100420a2045c00000001600002008b800100");
+        let mut packet = vec![0u8; 24 + record.len() + HASH_LEN + KEY_TRAILER_LEN];
+        packet[0x0a] = 0x80;
+        packet[0x0b] = 0x80;
+        LittleEndian::write_u16(&mut packet[0x08..0x0a], (24 + record.len()) as u16);
+        packet[24..24 + record.len()].copy_from_slice(&record);
+
+        let response = parse_search_list_packet(&packet).unwrap();
+        assert!(response.final_packet);
+        assert_eq!(response.players.len(), 1);
+        assert_eq!(response.players[0].name, "Aadam");
+        assert_eq!(response.players[0].zone, Some(246));
+        assert_eq!(response.players[0].nation, Some(1));
+        assert_eq!(response.players[0].main_job, Some(15));
+        assert_eq!(response.players[0].sub_job, Some(3));
+        assert_eq!(response.players[0].main_level, Some(75));
+        assert_eq!(response.players[0].sub_level, Some(37));
+        assert_eq!(response.players[0].race, Some(1));
+        assert_eq!(response.players[0].rank, Some(10));
+        assert_eq!(response.players[0].flags1, Some(0x2008));
+        assert_eq!(response.players[0].id, Some(165905));
+        assert_eq!(response.players[0].flags2, Some(0x2008));
+        assert_eq!(response.players[0].languages, Some(0x0002));
+    }
+
+    #[test]
     fn encrypted_sea_all_request_validates_as_client_request() {
         let mut writer = SearchCrypto::new();
         let encrypted = writer.encrypt(build_sea_all_request()).unwrap();
@@ -604,7 +695,8 @@ mod tests {
         let decrypted = reader.decrypt_client_request_for_test(encrypted).unwrap();
 
         assert_eq!(decrypted[0x0b], TCP_SEARCH_ALL);
-        assert_eq!(decrypted[0x10], 0);
+        assert_eq!(decrypted[0x10], 0x02);
+        assert_eq!(LittleEndian::read_u16(&decrypted[0x08..0x0a]), 0x13);
     }
 
     #[test]
@@ -622,5 +714,16 @@ mod tests {
 
         assert_eq!(decrypted[0x0a], 0x80);
         assert_eq!(decrypted[0x0b], 0x80);
+    }
+
+    fn decode_hex(hex: &str) -> Vec<u8> {
+        hex.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let hi = (pair[0] as char).to_digit(16).unwrap();
+                let lo = (pair[1] as char).to_digit(16).unwrap();
+                ((hi << 4) | lo) as u8
+            })
+            .collect()
     }
 }

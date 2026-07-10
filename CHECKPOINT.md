@@ -19,10 +19,12 @@ This repository now contains a Rust crate with a separated library and CLI:
 - `headless-xi sea-all --server <addr>` CLI command.
 - `SearchClient::list_online_players()` library API.
 - Search packet framing for the TCP search server.
-- `/sea all` request construction using request type `TCP_SEARCH_ALL = 0x00`.
+- `/sea all` request construction using the Horizon-captured `0x4c` request body and request type `TCP_SEARCH_ALL = 0x00`.
 - Search response decryption and MD5 validation.
 - Bit-level parser for current upstream LandSandBoat-style `CSearchListPacket` responses.
+- Fallback bit-level parser for Horizon's MSB-packed search result records.
 - Optional decrypted packet dumping via `HEADLESS_XI_DUMP_PACKETS=1`.
+- Short-read timeout handling after at least one valid page, so Horizon's one-request first page can be returned even when the packet is marked non-final.
 
 ## Crypto Notes
 
@@ -46,57 +48,54 @@ cargo fmt --check
 
 Current tests cover:
 
-- Minimal `/sea all` request shape.
+- Horizon-captured `/sea all` request shape.
 - Client request crypto compatibility round-trip.
 - Server response crypto compatibility round-trip.
 - Upstream LandSandBoat-style bit-packed player parsing.
+- Horizon MSB-packed player parsing using a record from `dumps/search-dump.pcap`.
 
 Live Horizon progress:
 
 ```sh
-scripts/horizon-sea-all.sh --timeout 10
+scripts/horizon-sea-all.sh --timeout 3
 ```
 
-The connection now reaches Horizon, receives a response, decrypts it, and passes MD5 validation.
+The connection now reaches Horizon, receives a response, decrypts it, passes MD5 validation, and prints the first page of online players.
 
-## Current Blocker
-
-Horizon's decrypted response does not match the current upstream LandSandBoat `CSearchListPacket::AddPlayer` bit layout. The parser currently fails with:
+Example live output shape:
 
 ```text
-invalid packet: unknown search entry 0xf
+Aadam    zone=246    job=15/3    lv=75/37    id=165905
+Aadhya   zone=35     job=10/3    lv=71/35    id=54611
 ```
 
-Diagnostic run:
+## Pcap Findings
 
-```sh
-HEADLESS_XI_DUMP_PACKETS=1 scripts/horizon-sea-all.sh --timeout 10
-```
+`dumps/search-dump.pcap` contained both TCP search-server traffic and UDP game-client traffic. The TCP traffic to `66.85.159.114:54002` matched our target path.
 
-This produced a valid decrypted response packet beginning:
+The captured TCP client request decrypts to a `0x4c` byte packet, not the original guessed `0x30` byte packet:
 
 ```text
-d7 03 00 00 49 58 46 46 c3 03 00 80 00 00 ff 07
-00 00 00 00 00 00 00 00 ...
+4c 00 00 00 49 58 46 46 13 00 80 00 00 00 00 00
+02 00 10 00 60 ea 00 00 60 ea 00 00 03 00 00 00
 ```
 
-Header observations:
+The captured/decrypted server response uses the same search field tags as current LandSandBoat but packs record bits MSB-first. For example, the first record:
 
-- Packet length: `0x03d7` / 983 bytes.
-- `IXFF` header present.
-- Data length at `0x08`: `0x03c3`.
-- Final flag/type bytes appear at `0x0a = 0x00`, `0x0b = 0x80`.
-- Total results at `0x0e`: `0x07ff`.
-- First record starts at byte `0x18`, consistent with current search-list packet structure.
+```text
+22 02 c1 c3 93 0e d0 9e c2 46 f1 91 2c 94 a3 00 ...
+```
 
-The per-record payload differs from current upstream documentation/code, so inferring it blindly is risky.
+decodes as:
 
-## Useful Next Evidence
+- Name: `Aadam`
+- Zone: `246`
+- Job: `15/3`
+- Level: `75/37`
+- Character ID: `165905`
 
-A packet dump from a known working client would be useful now, ideally:
+## Remaining Work
 
-- Client request to the search server for `/sea all`.
-- Server response packet(s) for `/sea all`.
-- If possible, decrypted payloads; otherwise raw TCP payloads are still useful now that local crypto works.
+The first milestone is functionally met: the CLI can list online players from Horizon XI.
 
-The next implementation step is to compare Horizon's record layout against a known-good client flow and extend `parse_player` for Horizon's additional/older search entry layout without breaking current LandSandBoat parsing.
+The known limitation is pagination. Horizon marks the first page as non-final when more results exist, but does not send the next page in response to the same single TCP request. The current client returns the accumulated first page after the socket read timeout. A future milestone should implement the follow-up page request flow observed in the pcap.
