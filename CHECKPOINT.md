@@ -1,101 +1,50 @@
 # Checkpoint
 
-## Goal
+## Prompt History
 
-Implement the first milestone from `SPECIFICATION.md`: a Rust library and CLI that can list online Final Fantasy XI players, equivalent to `/sea all`.
+1. `I would like you to read SPECIFICATION.md and attempt to implement it.`
+2. `Success for the first milestone looks like being able to list players that are online.`
+3. `OK, let's try that. Let me know if you need a packet dump as well.`
+4. `Let's write a CHECKPOINT.md to dump our current progress.`
+5. `OK, dumps/search-dump.pcap has a dump I took from Horizon live for you.`
+6. `Great! Let's make the output a bit more tabular. We should also be able to get a list of zone IDs and job IDs from LandServerBoat that we can check into the CLI and use to display a human readable string. Check those into the source code.`
+7. `Could you tell me if the packet dump I uploaded earlier contains any sensitive information such as strings?`
+8. `Could you mutate the git history to remove it from ever existing and add to .gitignore?`
+9. `OK, last thing to do: can we somehow take the bits that were horizon specific and add a new command line called "variant" and call it "horizon" and make the old LSB implementation called "lsb"? Ideally, the client should be able to work with both. We may need to update the shell script as well.`
+10. `Write a quick README`
+11. `Could you dump the entire prompt history into CHECKPOINT.md?`
 
-## Repository State
+## Implementation Status
 
-This repository now contains a Rust crate with a separated library and CLI:
+The current codebase now has:
 
-- `src/lib.rs` exports the reusable API.
-- `src/search.rs` contains search-server packet framing, crypto, TCP client logic, and search result parsing.
-- `src/bin/headless-xi.rs` is the CLI wrapper.
-- `scripts/horizon-sea-all.sh` runs the CLI against Horizon XI at `66.85.159.114:54002`.
-- `src/search/blowfish_consts.rs` vendors the Blowfish P/S constants used by the XI-compatible crypto implementation.
+- a reusable Rust library in `src/lib.rs`
+- the search client and packet parsing logic in `src/search.rs`
+- the CLI entrypoint in `src/bin/headless-xi.rs`
+- a Horizon-specific wrapper script in `scripts/horizon-sea-all.sh`
+- checked-in zone and job name mappings in `src/names.rs`
+- a top-level `README.md`
 
-## Implemented
+## Current Milestones
 
-- `headless-xi sea-all --server <addr>` CLI command.
-- `SearchClient::list_online_players()` library API.
-- Search packet framing for the TCP search server.
-- `/sea all` request construction using the Horizon-captured `0x4c` request body and request type `TCP_SEARCH_ALL = 0x00`.
-- Search response decryption and MD5 validation.
-- Bit-level parser for current upstream LandSandBoat-style `CSearchListPacket` responses.
-- Fallback bit-level parser for Horizon's MSB-packed search result records.
-- Optional decrypted packet dumping via `HEADLESS_XI_DUMP_PACKETS=1`.
-- Short-read timeout handling after at least one valid page, so Horizon's one-request first page can be returned even when the packet is marked non-final.
+- `sea-all` works against the default `lsb` variant.
+- `sea-all --variant horizon` works against Horizon XI.
+- The CLI prints a tabular list of online players.
+- Zone IDs and job IDs are rendered as human-readable names where known.
+- Packet capture dumps under `dumps/` are ignored by git.
 
-## Crypto Notes
+## Verification
 
-The standard RustCrypto `blowfish` crate was not compatible with LandSandBoat search packets because LandSandBoat uses an XI-specific Blowfish variant:
-
-- Custom `TT` round function from `src/common/blowfish.cpp`.
-- Client request decrypt/encrypt path uses MD5 over the first 20 key bytes.
-- Server response decrypt/encrypt path uses MD5 over all 24 key bytes.
-- `blowfish_init` takes `int8 key[]`, so MD5 bytes are sign-extended in the key schedule.
-
-`src/search.rs` now implements this compatibility path locally.
-
-## Verified
-
-Offline checks pass:
+Verified locally with:
 
 ```sh
-cargo test
 cargo fmt --check
-```
-
-Current tests cover:
-
-- Horizon-captured `/sea all` request shape.
-- Client request crypto compatibility round-trip.
-- Server response crypto compatibility round-trip.
-- Upstream LandSandBoat-style bit-packed player parsing.
-- Horizon MSB-packed player parsing using a record from `dumps/search-dump.pcap`.
-
-Live Horizon progress:
-
-```sh
+cargo test
+cargo run --bin headless-xi -- sea-all --help
 scripts/horizon-sea-all.sh --timeout 3
 ```
 
-The connection now reaches Horizon, receives a response, decrypts it, passes MD5 validation, and prints the first page of online players.
+## Notes
 
-Example live output shape:
-
-```text
-Aadam    zone=246    job=15/3    lv=75/37    id=165905
-Aadhya   zone=35     job=10/3    lv=71/35    id=54611
-```
-
-## Pcap Findings
-
-`dumps/search-dump.pcap` contained both TCP search-server traffic and UDP game-client traffic. The TCP traffic to `66.85.159.114:54002` matched our target path.
-
-The captured TCP client request decrypts to a `0x4c` byte packet, not the original guessed `0x30` byte packet:
-
-```text
-4c 00 00 00 49 58 46 46 13 00 80 00 00 00 00 00
-02 00 10 00 60 ea 00 00 60 ea 00 00 03 00 00 00
-```
-
-The captured/decrypted server response uses the same search field tags as current LandSandBoat but packs record bits MSB-first. For example, the first record:
-
-```text
-22 02 c1 c3 93 0e d0 9e c2 46 f1 91 2c 94 a3 00 ...
-```
-
-decodes as:
-
-- Name: `Aadam`
-- Zone: `246`
-- Job: `15/3`
-- Level: `75/37`
-- Character ID: `165905`
-
-## Remaining Work
-
-The first milestone is functionally met: the CLI can list online players from Horizon XI.
-
-The known limitation is pagination. Horizon marks the first page as non-final when more results exist, but does not send the next page in response to the same single TCP request. The current client returns the accumulated first page after the socket read timeout. A future milestone should implement the follow-up page request flow observed in the pcap.
+- The history rewrite to remove `dumps/search-dump.pcap` from git history was completed earlier in the session.
+- The current working tree may still contain untracked or ignored local files, but the source changes for the client are in place.
