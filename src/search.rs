@@ -17,6 +17,7 @@ const HORIZON_SEARCH_REQUEST_LEN: usize = 0x4c;
 const MAX_PACKET_LEN: usize = 4096;
 
 const TCP_SEARCH_ALL: u8 = 0x00;
+const TCP_SEARCH: u8 = 0x03;
 
 const SEARCH_NAME: u64 = 0x00;
 const SEARCH_AREA: u64 = 0x01;
@@ -113,6 +114,7 @@ pub struct SearchClient {
     addr: SocketAddr,
     timeout: Duration,
     variant: SearchVariant,
+    zone_filter: Option<u16>,
 }
 
 impl SearchClient {
@@ -121,6 +123,7 @@ impl SearchClient {
             addr,
             timeout: Duration::from_secs(10),
             variant: SearchVariant::default(),
+            zone_filter: None,
         }
     }
 
@@ -134,13 +137,23 @@ impl SearchClient {
         self
     }
 
+    pub fn with_zone_filter(mut self, zone: u16) -> Self {
+        self.zone_filter = Some(zone);
+        self
+    }
+
     pub fn list_online_players(&self) -> Result<Vec<OnlinePlayer>, SearchError> {
         let mut stream = TcpStream::connect_timeout(&self.addr, self.timeout)?;
         stream.set_read_timeout(Some(self.timeout))?;
         stream.set_write_timeout(Some(self.timeout))?;
 
         let mut crypto = SearchCrypto::new();
-        let request = crypto.encrypt(build_sea_all_request(self.variant))?;
+        let request = crypto.encrypt(build_search_request(
+            self.variant,
+            SearchQuery {
+                zone: self.zone_filter,
+            },
+        ))?;
         stream.write_all(&request)?;
 
         let mut players = Vec::new();
@@ -162,6 +175,12 @@ impl SearchClient {
             players.extend(response.players);
             if response.final_packet {
                 break;
+            }
+        }
+
+        if let Some(zone) = self.zone_filter {
+            for player in &mut players {
+                player.zone = Some(zone);
             }
         }
 
@@ -194,10 +213,30 @@ fn read_packet(stream: &mut TcpStream) -> Result<Vec<u8>, SearchError> {
     Ok(packet)
 }
 
+#[derive(Clone, Copy, Default)]
+struct SearchQuery {
+    zone: Option<u16>,
+}
+
+fn build_search_request(variant: SearchVariant, query: SearchQuery) -> Vec<u8> {
+    if let Some(zone) = query.zone {
+        build_zone_search_request(variant, zone)
+    } else {
+        build_sea_all_request(variant)
+    }
+}
+
 fn build_sea_all_request(variant: SearchVariant) -> Vec<u8> {
     match variant {
         SearchVariant::Lsb => build_lsb_sea_all_request(),
         SearchVariant::Horizon => build_horizon_sea_all_request(),
+    }
+}
+
+fn build_zone_search_request(variant: SearchVariant, zone: u16) -> Vec<u8> {
+    match variant {
+        SearchVariant::Lsb => build_lsb_zone_search_request(zone),
+        SearchVariant::Horizon => build_horizon_zone_search_request(zone),
     }
 }
 
@@ -206,6 +245,25 @@ fn build_lsb_sea_all_request() -> Vec<u8> {
     LittleEndian::write_u16(&mut packet[0..2], LSB_SEARCH_REQUEST_LEN as u16);
     LittleEndian::write_u32(&mut packet[4..8], IXFF);
     packet[0x0b] = TCP_SEARCH_ALL;
+    packet
+}
+
+fn build_lsb_zone_search_request(zone: u16) -> Vec<u8> {
+    let mut packet = vec![0u8; LSB_SEARCH_REQUEST_LEN];
+    LittleEndian::write_u16(&mut packet[0..2], LSB_SEARCH_REQUEST_LEN as u16);
+    LittleEndian::write_u32(&mut packet[4..8], IXFF);
+    packet[0x0b] = TCP_SEARCH;
+
+    let mut payload = [0u8; 3];
+    let mut offset = 0;
+    offset = pack_bits_le(&mut payload, offset, SEARCH_AREA, 5);
+    offset = pack_bits_le(&mut payload, offset, 0, 1);
+    offset = pack_bits_le(&mut payload, offset, 1, 1);
+    offset = pack_bits_le(&mut payload, offset, u64::from(zone), 10);
+    debug_assert!(offset <= payload.len() * 8);
+
+    packet[0x10] = payload.len() as u8;
+    packet[0x11..0x11 + payload.len()].copy_from_slice(&payload);
     packet
 }
 
@@ -224,6 +282,23 @@ fn build_horizon_sea_all_request() -> Vec<u8> {
     LittleEndian::write_u32(&mut packet[0x20..0x24], 3);
     LittleEndian::write_u32(&mut packet[0x24..0x28], 0x10);
     LittleEndian::write_u32(&mut packet[0x30..0x34], 60_000);
+    packet
+}
+
+fn build_horizon_zone_search_request(zone: u16) -> Vec<u8> {
+    let mut packet = build_horizon_sea_all_request();
+    packet[0x0b] = TCP_SEARCH;
+
+    let mut payload = [0u8; 4];
+    let mut offset = 0;
+    offset = pack_bits_le(&mut payload, offset, SEARCH_AREA, 5);
+    offset = pack_bits_le(&mut payload, offset, 0, 1);
+    offset = pack_bits_le(&mut payload, offset, 1, 1);
+    offset = pack_bits_le(&mut payload, offset, u64::from(zone), 10);
+    debug_assert!(offset <= payload.len() * 8);
+
+    packet[0x10] = payload.len() as u8;
+    packet[0x11..0x11 + payload.len()].copy_from_slice(&payload);
     packet
 }
 
@@ -643,6 +718,19 @@ fn unpack_bits_le(buf: &[u8], bit_offset: usize, width: usize) -> u64 {
     value
 }
 
+fn pack_bits_le(buf: &mut [u8], mut bit_offset: usize, value: u64, width: usize) -> usize {
+    for bit in 0..width {
+        let absolute = bit_offset + bit;
+        let byte = absolute / 8;
+        let bit_in_byte = absolute % 8;
+        if ((value >> bit) & 1) != 0 {
+            buf[byte] |= 1 << bit_in_byte;
+        }
+    }
+    bit_offset += width;
+    bit_offset
+}
+
 fn unpack_bits_msb(buf: &[u8], bit_offset: usize, width: usize) -> u64 {
     let mut value = 0u64;
     for bit in 0..width {
@@ -658,19 +746,6 @@ fn unpack_bits_msb(buf: &[u8], bit_offset: usize, width: usize) -> u64 {
 mod tests {
     use super::*;
 
-    fn pack_bits_le(buf: &mut [u8], mut bit_offset: usize, value: u64, width: usize) -> usize {
-        for bit in 0..width {
-            let absolute = bit_offset + bit;
-            let byte = absolute / 8;
-            let bit_in_byte = absolute % 8;
-            if ((value >> bit) & 1) != 0 {
-                buf[byte] |= 1 << bit_in_byte;
-            }
-        }
-        bit_offset += width;
-        bit_offset
-    }
-
     #[test]
     fn lsb_sea_all_request_sets_minimal_search_all_body() {
         let packet = build_sea_all_request(SearchVariant::Lsb);
@@ -681,6 +756,38 @@ mod tests {
         assert_eq!(LittleEndian::read_u32(&packet[4..8]), IXFF);
         assert_eq!(packet[0x0b], TCP_SEARCH_ALL);
         assert_eq!(packet[0x10], 0);
+    }
+
+    #[test]
+    fn lsb_zone_request_encodes_area_filter() {
+        let packet = build_search_request(SearchVariant::Lsb, SearchQuery { zone: Some(230) });
+        assert_eq!(
+            LittleEndian::read_u16(&packet[0..2]),
+            LSB_SEARCH_REQUEST_LEN as u16
+        );
+        assert_eq!(LittleEndian::read_u32(&packet[4..8]), IXFF);
+        assert_eq!(packet[0x0b], TCP_SEARCH);
+        assert_eq!(packet[0x10], 3);
+        assert_eq!(unpack_bits_le(&packet[0x11..0x14], 0, 5), SEARCH_AREA);
+        assert_eq!(unpack_bits_le(&packet[0x11..0x14], 5, 1), 0);
+        assert_eq!(unpack_bits_le(&packet[0x11..0x14], 6, 1), 1);
+        assert_eq!(unpack_bits_le(&packet[0x11..0x14], 7, 10), 230);
+    }
+
+    #[test]
+    fn horizon_zone_request_encodes_area_filter() {
+        let packet = build_search_request(SearchVariant::Horizon, SearchQuery { zone: Some(246) });
+        assert_eq!(
+            LittleEndian::read_u16(&packet[0..2]),
+            HORIZON_SEARCH_REQUEST_LEN as u16
+        );
+        assert_eq!(LittleEndian::read_u32(&packet[4..8]), IXFF);
+        assert_eq!(packet[0x0b], TCP_SEARCH);
+        assert_eq!(packet[0x10], 4);
+        assert_eq!(unpack_bits_le(&packet[0x11..0x15], 0, 5), SEARCH_AREA);
+        assert_eq!(unpack_bits_le(&packet[0x11..0x15], 5, 1), 0);
+        assert_eq!(unpack_bits_le(&packet[0x11..0x15], 6, 1), 1);
+        assert_eq!(unpack_bits_le(&packet[0x11..0x15], 7, 10), 246);
     }
 
     #[test]

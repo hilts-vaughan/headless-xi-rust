@@ -25,6 +25,12 @@ Target a specific server or switch variants:
 cargo run --bin headless-xi -- sea-all --server 66.85.159.114:54002 --variant horizon
 ```
 
+Filter results to a specific zone ID:
+
+```bash
+cargo run --bin headless-xi -- sea-all --zone 230
+```
+
 ## Development
 
 Run the tests:

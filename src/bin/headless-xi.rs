@@ -27,6 +27,10 @@ enum Command {
         /// Socket timeout in seconds.
         #[arg(long, default_value_t = 10)]
         timeout: u64,
+
+        /// Restrict results to a specific zone ID.
+        #[arg(long, value_parser = parse_zone_id)]
+        zone: Option<u16>,
     },
 }
 
@@ -52,10 +56,14 @@ fn main() {
             server,
             variant,
             timeout,
+            zone,
         } => {
-            let client = SearchClient::new(server)
+            let mut client = SearchClient::new(server)
                 .with_timeout(Duration::from_secs(timeout))
                 .with_variant(variant.into());
+            if let Some(zone) = zone {
+                client = client.with_zone_filter(zone);
+            }
             match client.list_online_players() {
                 Ok(players) => {
                     print_players(&players);
@@ -70,6 +78,16 @@ fn main() {
         eprintln!("error: {err}");
         std::process::exit(1);
     }
+}
+
+fn parse_zone_id(value: &str) -> Result<u16, String> {
+    let zone = value
+        .parse::<u16>()
+        .map_err(|_| format!("invalid zone ID `{value}`"))?;
+    if zone > 1023 {
+        return Err(format!("zone ID `{zone}` is too large; expected 0..=1023"));
+    }
+    Ok(zone)
 }
 
 struct PlayerRow {
