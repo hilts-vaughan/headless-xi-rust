@@ -12,7 +12,8 @@ const IXFF: u32 = 0x4646_5849;
 const HEADER_LEN: usize = 8;
 const HASH_LEN: usize = 16;
 const KEY_TRAILER_LEN: usize = 4;
-const SEARCH_REQUEST_LEN: usize = 0x4c;
+const LSB_SEARCH_REQUEST_LEN: usize = 0x30;
+const HORIZON_SEARCH_REQUEST_LEN: usize = 0x4c;
 const MAX_PACKET_LEN: usize = 4096;
 
 const TCP_SEARCH_ALL: u8 = 0x00;
@@ -35,6 +36,31 @@ const INITIAL_KEY: [u8; 24] = [
     0x30, 0x73, 0x3D, 0x6D, 0x3C, 0x31, 0x49, 0x5A, 0x32, 0x7A, 0x42, 0x43, 0x63, 0x38, 0x7B, 0x7E,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchVariant {
+    Lsb,
+    Horizon,
+}
+
+impl Default for SearchVariant {
+    fn default() -> Self {
+        Self::Lsb
+    }
+}
+
+impl SearchVariant {
+    fn bit_orders(self) -> &'static [BitOrder] {
+        match self {
+            Self::Lsb => &[BitOrder::Lsb],
+            Self::Horizon => &[BitOrder::Msb],
+        }
+    }
+
+    fn return_partial_results_on_timeout(self) -> bool {
+        matches!(self, Self::Horizon)
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum SearchError {
@@ -86,6 +112,7 @@ impl OnlinePlayer {
 pub struct SearchClient {
     addr: SocketAddr,
     timeout: Duration,
+    variant: SearchVariant,
 }
 
 impl SearchClient {
@@ -93,11 +120,17 @@ impl SearchClient {
         Self {
             addr,
             timeout: Duration::from_secs(10),
+            variant: SearchVariant::default(),
         }
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    pub fn with_variant(mut self, variant: SearchVariant) -> Self {
+        self.variant = variant;
         self
     }
 
@@ -107,7 +140,7 @@ impl SearchClient {
         stream.set_write_timeout(Some(self.timeout))?;
 
         let mut crypto = SearchCrypto::new();
-        let request = crypto.encrypt(build_sea_all_request())?;
+        let request = crypto.encrypt(build_sea_all_request(self.variant))?;
         stream.write_all(&request)?;
 
         let mut players = Vec::new();
@@ -115,12 +148,17 @@ impl SearchClient {
             let packet = match read_packet(&mut stream) {
                 Ok(packet) => packet,
                 Err(SearchError::Io(err)) if players.is_empty() => return Err(err.into()),
-                Err(SearchError::Io(err)) if is_timeout_error(&err) => break,
+                Err(SearchError::Io(err))
+                    if self.variant.return_partial_results_on_timeout()
+                        && is_timeout_error(&err) =>
+                {
+                    break
+                }
                 Err(err) => return Err(err),
             };
             let decoded = crypto.decrypt(packet)?;
             dump_packet_if_requested(&decoded);
-            let response = parse_search_list_packet(&decoded)?;
+            let response = parse_search_list_packet(&decoded, self.variant)?;
             players.extend(response.players);
             if response.final_packet {
                 break;
@@ -156,9 +194,24 @@ fn read_packet(stream: &mut TcpStream) -> Result<Vec<u8>, SearchError> {
     Ok(packet)
 }
 
-fn build_sea_all_request() -> Vec<u8> {
-    let mut packet = vec![0u8; SEARCH_REQUEST_LEN];
-    LittleEndian::write_u16(&mut packet[0..2], SEARCH_REQUEST_LEN as u16);
+fn build_sea_all_request(variant: SearchVariant) -> Vec<u8> {
+    match variant {
+        SearchVariant::Lsb => build_lsb_sea_all_request(),
+        SearchVariant::Horizon => build_horizon_sea_all_request(),
+    }
+}
+
+fn build_lsb_sea_all_request() -> Vec<u8> {
+    let mut packet = vec![0u8; LSB_SEARCH_REQUEST_LEN];
+    LittleEndian::write_u16(&mut packet[0..2], LSB_SEARCH_REQUEST_LEN as u16);
+    LittleEndian::write_u32(&mut packet[4..8], IXFF);
+    packet[0x0b] = TCP_SEARCH_ALL;
+    packet
+}
+
+fn build_horizon_sea_all_request() -> Vec<u8> {
+    let mut packet = vec![0u8; HORIZON_SEARCH_REQUEST_LEN];
+    LittleEndian::write_u16(&mut packet[0..2], HORIZON_SEARCH_REQUEST_LEN as u16);
     LittleEndian::write_u32(&mut packet[4..8], IXFF);
     LittleEndian::write_u16(&mut packet[0x08..0x0a], 0x13);
     packet[0x0a] = 0x80;
@@ -412,7 +465,10 @@ struct SearchListResponse {
     players: Vec<OnlinePlayer>,
 }
 
-fn parse_search_list_packet(packet: &[u8]) -> Result<SearchListResponse, SearchError> {
+fn parse_search_list_packet(
+    packet: &[u8],
+    variant: SearchVariant,
+) -> Result<SearchListResponse, SearchError> {
     if packet.len() < 0x20 {
         return Err(SearchError::InvalidPacket(
             "search list packet too short".into(),
@@ -438,12 +494,7 @@ fn parse_search_list_packet(packet: &[u8]) -> Result<SearchListResponse, SearchE
         }
         let entity_end = (size_offset + entity_size + 1) * 8;
         offset += 8;
-        let player_start = offset;
-        let player =
-            parse_player(packet, &mut offset, entity_end, BitOrder::Lsb).or_else(|_| {
-                offset = player_start;
-                parse_player(packet, &mut offset, entity_end, BitOrder::Msb)
-            })?;
+        let player = parse_player_with_variant(packet, &mut offset, entity_end, variant)?;
         if is_valid_player_name(&player.name) {
             players.push(player);
         }
@@ -454,6 +505,26 @@ fn parse_search_list_packet(packet: &[u8]) -> Result<SearchListResponse, SearchE
         final_packet: packet[0x0a] & 0x80 != 0,
         players,
     })
+}
+
+fn parse_player_with_variant(
+    packet: &[u8],
+    offset: &mut usize,
+    entity_end_bits: usize,
+    variant: SearchVariant,
+) -> Result<OnlinePlayer, SearchError> {
+    let player_start = *offset;
+    let mut last_err = None;
+    for bit_order in variant.bit_orders() {
+        *offset = player_start;
+        match parse_player(packet, offset, entity_end_bits, *bit_order) {
+            Ok(player) => return Ok(player),
+            Err(err) => last_err = Some(err),
+        }
+    }
+
+    Err(last_err
+        .unwrap_or_else(|| SearchError::InvalidPacket("no parser available for variant".into())))
 }
 
 fn parse_player(
@@ -601,11 +672,23 @@ mod tests {
     }
 
     #[test]
-    fn sea_all_request_matches_captured_search_all_body() {
-        let packet = build_sea_all_request();
+    fn lsb_sea_all_request_sets_minimal_search_all_body() {
+        let packet = build_sea_all_request(SearchVariant::Lsb);
         assert_eq!(
             LittleEndian::read_u16(&packet[0..2]),
-            SEARCH_REQUEST_LEN as u16
+            LSB_SEARCH_REQUEST_LEN as u16
+        );
+        assert_eq!(LittleEndian::read_u32(&packet[4..8]), IXFF);
+        assert_eq!(packet[0x0b], TCP_SEARCH_ALL);
+        assert_eq!(packet[0x10], 0);
+    }
+
+    #[test]
+    fn horizon_sea_all_request_matches_captured_search_all_body() {
+        let packet = build_sea_all_request(SearchVariant::Horizon);
+        assert_eq!(
+            LittleEndian::read_u16(&packet[0..2]),
+            HORIZON_SEARCH_REQUEST_LEN as u16
         );
         assert_eq!(LittleEndian::read_u32(&packet[4..8]), IXFF);
         assert_eq!(LittleEndian::read_u16(&packet[0x08..0x0a]), 0x13);
@@ -646,7 +729,7 @@ mod tests {
         packet[size_offset] = (offset / 8 - size_offset - 1) as u8;
         LittleEndian::write_u16(&mut packet[0x08..0x0a], (offset / 8) as u16);
 
-        let response = parse_search_list_packet(&packet).unwrap();
+        let response = parse_search_list_packet(&packet, SearchVariant::Lsb).unwrap();
         assert!(response.final_packet);
         assert_eq!(response.players.len(), 1);
         assert_eq!(response.players[0].name, "Test");
@@ -668,7 +751,7 @@ mod tests {
         LittleEndian::write_u16(&mut packet[0x08..0x0a], (24 + record.len()) as u16);
         packet[24..24 + record.len()].copy_from_slice(&record);
 
-        let response = parse_search_list_packet(&packet).unwrap();
+        let response = parse_search_list_packet(&packet, SearchVariant::Horizon).unwrap();
         assert!(response.final_packet);
         assert_eq!(response.players.len(), 1);
         assert_eq!(response.players[0].name, "Aadam");
@@ -689,7 +772,9 @@ mod tests {
     #[test]
     fn encrypted_sea_all_request_validates_as_client_request() {
         let mut writer = SearchCrypto::new();
-        let encrypted = writer.encrypt(build_sea_all_request()).unwrap();
+        let encrypted = writer
+            .encrypt(build_sea_all_request(SearchVariant::Horizon))
+            .unwrap();
 
         let mut reader = SearchCrypto::new();
         let decrypted = reader.decrypt_client_request_for_test(encrypted).unwrap();

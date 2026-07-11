@@ -1,8 +1,8 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
-use headless_xi::{names, OnlinePlayer, SearchClient};
+use clap::{Parser, Subcommand, ValueEnum};
+use headless_xi::{names, OnlinePlayer, SearchClient, SearchVariant};
 
 #[derive(Debug, Parser)]
 #[command(name = "headless-xi")]
@@ -16,9 +16,13 @@ struct Cli {
 enum Command {
     /// List online players via the search server.
     SeaAll {
-        /// Search server address, for example.
-        #[arg(long, default_value = "")]
+        /// Search server address, for example 66.85.159.114:54002.
+        #[arg(long, default_value = "66.85.159.114:54002")]
         server: SocketAddr,
+
+        /// Protocol variant to use.
+        #[arg(long, value_enum, default_value_t = CliVariant::Lsb)]
+        variant: CliVariant,
 
         /// Socket timeout in seconds.
         #[arg(long, default_value_t = 10)]
@@ -26,11 +30,32 @@ enum Command {
     },
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliVariant {
+    Lsb,
+    Horizon,
+}
+
+impl From<CliVariant> for SearchVariant {
+    fn from(value: CliVariant) -> Self {
+        match value {
+            CliVariant::Lsb => SearchVariant::Lsb,
+            CliVariant::Horizon => SearchVariant::Horizon,
+        }
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::SeaAll { server, timeout } => {
-            let client = SearchClient::new(server).with_timeout(Duration::from_secs(timeout));
+        Command::SeaAll {
+            server,
+            variant,
+            timeout,
+        } => {
+            let client = SearchClient::new(server)
+                .with_timeout(Duration::from_secs(timeout))
+                .with_variant(variant.into());
             match client.list_online_players() {
                 Ok(players) => {
                     print_players(&players);
