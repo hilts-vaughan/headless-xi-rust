@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use headless_xi::SearchClient;
+use headless_xi::{names, OnlinePlayer, SearchClient};
 
 #[derive(Debug, Parser)]
 #[command(name = "headless-xi")]
@@ -33,30 +33,7 @@ fn main() {
             let client = SearchClient::new(server).with_timeout(Duration::from_secs(timeout));
             match client.list_online_players() {
                 Ok(players) => {
-                    for player in players {
-                        println!(
-                            "{}\tzone={}\tjob={}/{}\tlv={}/{}\tid={}",
-                            player.name,
-                            player.zone.map(display).unwrap_or_else(|| "-".to_string()),
-                            player
-                                .main_job
-                                .map(display)
-                                .unwrap_or_else(|| "-".to_string()),
-                            player
-                                .sub_job
-                                .map(display)
-                                .unwrap_or_else(|| "-".to_string()),
-                            player
-                                .main_level
-                                .map(display)
-                                .unwrap_or_else(|| "-".to_string()),
-                            player
-                                .sub_level
-                                .map(display)
-                                .unwrap_or_else(|| "-".to_string()),
-                            player.id.map(display).unwrap_or_else(|| "-".to_string())
-                        );
-                    }
+                    print_players(&players);
                     Ok(())
                 }
                 Err(err) => Err(err.to_string()),
@@ -70,6 +47,90 @@ fn main() {
     }
 }
 
-fn display<T: std::fmt::Display>(value: T) -> String {
-    value.to_string()
+struct PlayerRow {
+    name: String,
+    zone: String,
+    job: String,
+    level: String,
+    id: String,
+}
+
+fn print_players(players: &[OnlinePlayer]) {
+    let rows: Vec<_> = players.iter().map(player_row).collect();
+    let name_width = column_width("NAME", rows.iter().map(|row| row.name.as_str()));
+    let zone_width = column_width("ZONE", rows.iter().map(|row| row.zone.as_str()));
+    let job_width = column_width("JOB", rows.iter().map(|row| row.job.as_str()));
+    let level_width = column_width("LV", rows.iter().map(|row| row.level.as_str()));
+    let id_width = column_width("ID", rows.iter().map(|row| row.id.as_str()));
+
+    println!(
+        "{:<name_width$}  {:<zone_width$}  {:<job_width$}  {:>level_width$}  {:>id_width$}",
+        "NAME", "ZONE", "JOB", "LV", "ID"
+    );
+    println!(
+        "{:-<name_width$}  {:-<zone_width$}  {:-<job_width$}  {:-<level_width$}  {:-<id_width$}",
+        "", "", "", "", ""
+    );
+
+    for row in rows {
+        println!(
+            "{:<name_width$}  {:<zone_width$}  {:<job_width$}  {:>level_width$}  {:>id_width$}",
+            row.name, row.zone, row.job, row.level, row.id
+        );
+    }
+}
+
+fn player_row(player: &OnlinePlayer) -> PlayerRow {
+    PlayerRow {
+        name: player.name.clone(),
+        zone: player
+            .zone
+            .map(format_zone)
+            .unwrap_or_else(|| "-".to_string()),
+        job: format_job_pair(player.main_job, player.sub_job),
+        level: format_optional_pair(player.main_level, player.sub_level),
+        id: player
+            .id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+    }
+}
+
+fn column_width<'a>(header: &str, values: impl Iterator<Item = &'a str>) -> usize {
+    values
+        .map(str::len)
+        .max()
+        .unwrap_or_default()
+        .max(header.len())
+}
+
+fn format_zone(zone: u16) -> String {
+    match names::zone_name(zone) {
+        Some(name) => format!("{name} ({zone})"),
+        None => format!("#{zone}"),
+    }
+}
+
+fn format_job_pair(main: Option<u8>, sub: Option<u8>) -> String {
+    match (main, sub) {
+        (Some(main), Some(sub)) => format!("{}/{}", format_job(main), format_job(sub)),
+        (Some(main), None) => format!("{}/-", format_job(main)),
+        (None, Some(sub)) => format!("-/{}", format_job(sub)),
+        (None, None) => "-".to_string(),
+    }
+}
+
+fn format_job(job: u8) -> String {
+    names::job_name(job)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("#{job}"))
+}
+
+fn format_optional_pair<T: std::fmt::Display>(main: Option<T>, sub: Option<T>) -> String {
+    match (main, sub) {
+        (Some(main), Some(sub)) => format!("{main}/{sub}"),
+        (Some(main), None) => format!("{main}/-"),
+        (None, Some(sub)) => format!("-/{sub}"),
+        (None, None) => "-".to_string(),
+    }
 }

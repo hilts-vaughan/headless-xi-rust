@@ -16,3 +16,8 @@ Make sure to seperate out the CLI from the create logic that will allow parsing 
 We will need a live server to test against. As far as I can tell, one such server is found at `66.85.159.114:54002` and it is known as "Horizon XI". You can should try to connect to this one. Unit tests should be done until we're sure things work. We should only connect to a live instance once we're sure things work.
 
 Let's make running the CLI the way to test against this. Make a shell script for Horizon specifically.
+
+# Important Links
+
+- Search Handler: https://github.com/LandSandBoat/server/blob/base/src/search/search_handler.cpp
+- Search List: https://github.com/LandSandBoat/server/blob/base/src/search/packets/search_list.cpp

@@ -545,7 +545,7 @@ fn parse_player(
 }
 
 fn is_valid_player_name(name: &str) -> bool {
-    !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_graphic())
+    !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_alphabetic())
 }
 
 #[derive(Clone, Copy)]
